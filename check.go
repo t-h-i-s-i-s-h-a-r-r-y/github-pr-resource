@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/shurcooL/githubv4"
@@ -83,44 +84,27 @@ Loop:
 			continue
 		}
 
-		// Fetch files once if paths/ignore_paths are specified.
-		var files []string
-
+		// Filter pull request if paths or ignorePaths is specified and no wanted paths were found
 		if len(request.Source.Paths) > 0 || len(request.Source.IgnorePaths) > 0 {
-			files, err = manager.ListModifiedFiles(p.Number)
+			found, err := HasWantedFiles(
+				strconv.Itoa(p.Number),
+				request.Source.Paths,
+				request.Source.IgnorePaths,
+				p.Files,
+				p.FilesPageInfo.HasNextPage,
+				string(p.FilesPageInfo.EndCursor),
+				manager,
+			)
+
 			if err != nil {
-				return nil, fmt.Errorf("failed to list modified files: %s", err)
+				return nil, err
 			}
-		}
 
-		// Skip version if no files match the specified paths.
-		if len(request.Source.Paths) > 0 {
-			var wanted []string
-			for _, pattern := range request.Source.Paths {
-				w, err := FilterPath(files, pattern)
-				if err != nil {
-					return nil, fmt.Errorf("path match failed: %s", err)
-				}
-				wanted = append(wanted, w...)
-			}
-			if len(wanted) == 0 {
+			if !found {
 				continue Loop
 			}
 		}
 
-		// Skip version if all files are ignored.
-		if len(request.Source.IgnorePaths) > 0 {
-			wanted := files
-			for _, pattern := range request.Source.IgnorePaths {
-				wanted, err = FilterIgnorePath(wanted, pattern)
-				if err != nil {
-					return nil, fmt.Errorf("ignore path match failed: %s", err)
-				}
-			}
-			if len(wanted) == 0 {
-				continue Loop
-			}
-		}
 		response = append(response, NewVersion(p))
 	}
 
@@ -138,6 +122,55 @@ Loop:
 	return response, nil
 }
 
+func HasWantedFiles(prNumber string, paths []string, ignorePaths []string, files []ChangedFileObject, hasMoreFiles bool, nextFileCursor string, manager Github) (bool, error) {
+	// construct a slice that contains 'wanted' files and use this to determine if we should continue
+	// files are wanted either when they appear in the paths list or don't appear in the ignore paths list
+	var wanted []ChangedFileObject
+	var err error
+
+	if len(paths) > 0 {
+		for _, pattern := range paths {
+			w, err := FilterPath(files, pattern)
+			if err != nil {
+				return false, fmt.Errorf("path match failed: %s", err)
+			}
+			wanted = append(wanted, w...)
+		}
+	} else {
+		wanted = files
+	}
+
+	for _, pattern := range ignorePaths {
+		wanted, err = FilterIgnorePath(wanted, pattern)
+		if err != nil {
+			return false, fmt.Errorf("ignore path match failed: %s", err)
+		}
+	}
+
+	if len(wanted) > 0 {
+		// wanted files were found
+		return true, nil
+	}
+
+	if !hasMoreFiles {
+		// no wanted files were found and there are no more files to examine
+		return false, nil
+	}
+
+	// no wanted files were found, but there are more files to check
+	// fetch them now and then check them in another iteration of this function
+	files, hasMoreFiles, nextFileCursor, err = manager.GetChangedFiles(
+		prNumber,
+		100,
+		nextFileCursor,
+	)
+	if err != nil {
+		return false, fmt.Errorf("get more files failed: %s", err)
+	}
+
+	return HasWantedFiles(prNumber, paths, ignorePaths, files, hasMoreFiles, nextFileCursor, manager)
+}
+
 // ContainsSkipCI returns true if a string contains [ci skip] or [skip ci].
 func ContainsSkipCI(s string) bool {
 	re := regexp.MustCompile("(?i)\\[(ci skip|skip ci)\\]")
@@ -145,30 +178,32 @@ func ContainsSkipCI(s string) bool {
 }
 
 // FilterIgnorePath ...
-func FilterIgnorePath(files []string, pattern string) ([]string, error) {
-	var out []string
-	for _, file := range files {
+func FilterIgnorePath(files []ChangedFileObject, pattern string) ([]ChangedFileObject, error) {
+	var out []ChangedFileObject
+	for _, cfo := range files {
+		file := cfo.Path
 		match, err := filepath.Match(pattern, file)
 		if err != nil {
 			return nil, err
 		}
 		if !match && !IsInsidePath(pattern, file) {
-			out = append(out, file)
+			out = append(out, cfo)
 		}
 	}
 	return out, nil
 }
 
 // FilterPath ...
-func FilterPath(files []string, pattern string) ([]string, error) {
-	var out []string
-	for _, file := range files {
+func FilterPath(files []ChangedFileObject, pattern string) ([]ChangedFileObject, error) {
+	var out []ChangedFileObject
+	for _, cfo := range files {
+		file := cfo.Path
 		match, err := filepath.Match(pattern, file)
 		if err != nil {
 			return nil, err
 		}
 		if match || IsInsidePath(pattern, file) {
-			out = append(out, file)
+			out = append(out, cfo)
 		}
 	}
 	return out, nil

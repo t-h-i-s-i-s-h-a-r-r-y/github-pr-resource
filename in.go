@@ -105,15 +105,24 @@ func Get(request GetRequest, github Github, git Git, outputDir string) (*GetResp
 	}
 
 	if request.Params.ListChangedFiles {
-		cfol, err := github.GetChangedFiles(request.Version.PR, request.Version.Commit)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch list of changed files: %s", err)
-		}
-
+		var cfol []ChangedFileObject
 		var fl []byte
+		var hasNext bool
+		var nextCursor string
 
-		for _, v := range cfol {
-			fl = append(fl, []byte(v.Path+"\n")...)
+		for {
+			cfol, hasNext, nextCursor, err = github.GetChangedFiles(request.Version.PR, 100, nextCursor)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch list of changed files: %s", err)
+			}
+
+			for _, v := range cfol {
+				fl = append(fl, []byte(v.Path+"\n")...)
+			}
+
+			if !hasNext {
+				break
+			}
 		}
 
 		// Create List with changed files

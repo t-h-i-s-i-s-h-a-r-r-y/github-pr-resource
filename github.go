@@ -21,10 +21,9 @@ import (
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o fakes/fake_github.go . Github
 type Github interface {
 	ListPullRequests([]githubv4.PullRequestState) ([]*PullRequest, error)
-	ListModifiedFiles(int) ([]string, error)
 	PostComment(string, string) error
 	GetPullRequest(string, string) (*PullRequest, error)
-	GetChangedFiles(string, string) ([]ChangedFileObject, error)
+	GetChangedFiles(string, int, string) ([]ChangedFileObject, bool, string, error)
 	UpdateCommitStatus(string, string, string, string, string, string) error
 	DeletePreviousComments(string) error
 }
@@ -122,6 +121,14 @@ func (m *GithubClient) ListPullRequests(prStates []githubv4.PullRequestState) ([
 								}
 							}
 						} `graphql:"labels(first:$labelsFirst)"`
+						Files struct {
+							Edges []struct {
+								Node struct {
+									ChangedFileObject
+								}
+							} `graphql:"edges"`
+							PageInfo PageInfoObject `graphql:"pageInfo"`
+						} `graphql:"files(first:$changedFilesFirst)"`
 					}
 				}
 				PageInfo struct {
@@ -133,14 +140,15 @@ func (m *GithubClient) ListPullRequests(prStates []githubv4.PullRequestState) ([
 	}
 
 	vars := map[string]interface{}{
-		"repositoryOwner": githubv4.String(m.Owner),
-		"repositoryName":  githubv4.String(m.Repository),
-		"prFirst":         githubv4.Int(100),
-		"prStates":        prStates,
-		"prCursor":        (*githubv4.String)(nil),
-		"commitsLast":     githubv4.Int(1),
-		"prReviewStates":  []githubv4.PullRequestReviewState{githubv4.PullRequestReviewStateApproved},
-		"labelsFirst":     githubv4.Int(100),
+		"repositoryOwner":   githubv4.String(m.Owner),
+		"repositoryName":    githubv4.String(m.Repository),
+		"prFirst":           githubv4.Int(100),
+		"prStates":          prStates,
+		"prCursor":          (*githubv4.String)(nil),
+		"commitsLast":       githubv4.Int(1),
+		"prReviewStates":    []githubv4.PullRequestReviewState{githubv4.PullRequestReviewStateApproved},
+		"labelsFirst":       githubv4.Int(100),
+		"changedFilesFirst": githubv4.Int(100),
 	}
 
 	var response []*PullRequest
@@ -154,12 +162,19 @@ func (m *GithubClient) ListPullRequests(prStates []githubv4.PullRequestState) ([
 				labels = append(labels, l.Node.LabelObject)
 			}
 
+			files := make([]ChangedFileObject, len(p.Node.Files.Edges))
+			for _, f := range p.Node.Files.Edges {
+				files = append(files, f.Node.ChangedFileObject)
+			}
+
 			for _, c := range p.Node.Commits.Edges {
 				response = append(response, &PullRequest{
 					PullRequestObject:   p.Node.PullRequestObject,
 					Tip:                 c.Node.Commit,
 					ApprovedReviewCount: p.Node.Reviews.TotalCount,
 					Labels:              labels,
+					Files:               files,
+					FilesPageInfo:       p.Node.Files.PageInfo,
 				})
 			}
 		}
@@ -169,35 +184,6 @@ func (m *GithubClient) ListPullRequests(prStates []githubv4.PullRequestState) ([
 		vars["prCursor"] = query.Repository.PullRequests.PageInfo.EndCursor
 	}
 	return response, nil
-}
-
-// ListModifiedFiles in a pull request (not supported by V4 API).
-func (m *GithubClient) ListModifiedFiles(prNumber int) ([]string, error) {
-	var files []string
-
-	opt := &github.ListOptions{
-		PerPage: 100,
-	}
-	for {
-		result, response, err := m.V3.PullRequests.ListFiles(
-			context.TODO(),
-			m.Owner,
-			m.Repository,
-			prNumber,
-			opt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		for _, f := range result {
-			files = append(files, *f.Filename)
-		}
-		if response.NextPage == 0 {
-			break
-		}
-		opt.Page = response.NextPage
-	}
-	return files, nil
 }
 
 // PostComment to a pull request or issue.
@@ -220,10 +206,10 @@ func (m *GithubClient) PostComment(prNumber, comment string) error {
 }
 
 // GetChangedFiles ...
-func (m *GithubClient) GetChangedFiles(prNumber string, commitRef string) ([]ChangedFileObject, error) {
+func (m *GithubClient) GetChangedFiles(prNumber string, perPage int, afterCursor string) ([]ChangedFileObject, bool, string, error) {
 	pr, err := strconv.Atoi(prNumber)
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert pull request number to int: %s", err)
+		return nil, false, "", fmt.Errorf("failed to convert pull request number to int: %s", err)
 	}
 
 	var cfo []ChangedFileObject
@@ -246,33 +232,26 @@ func (m *GithubClient) GetChangedFiles(prNumber string, commitRef string) ([]Cha
 		} `graphql:"repository(owner:$repositoryOwner,name:$repositoryName)"`
 	}
 
-	offset := ""
-
-	for {
-		vars := map[string]interface{}{
-			"repositoryOwner":       githubv4.String(m.Owner),
-			"repositoryName":        githubv4.String(m.Repository),
-			"prNumber":              githubv4.Int(pr),
-			"changedFilesFirst":     githubv4.Int(100),
-			"changedFilesEndCursor": githubv4.String(offset),
-		}
-
-		if err := m.V4.Query(context.TODO(), &filequery, vars); err != nil {
-			return nil, err
-		}
-
-		for _, f := range filequery.Repository.PullRequest.Files.Edges {
-			cfo = append(cfo, ChangedFileObject{Path: f.Node.Path})
-		}
-
-		if !filequery.Repository.PullRequest.Files.PageInfo.HasNextPage {
-			break
-		}
-
-		offset = string(filequery.Repository.PullRequest.Files.PageInfo.EndCursor)
+	vars := map[string]interface{}{
+		"repositoryOwner":       githubv4.String(m.Owner),
+		"repositoryName":        githubv4.String(m.Repository),
+		"prNumber":              githubv4.Int(pr),
+		"changedFilesFirst":     githubv4.Int(perPage),
+		"changedFilesEndCursor": githubv4.String(afterCursor),
 	}
 
-	return cfo, nil
+	if err := m.V4.Query(context.TODO(), &filequery, vars); err != nil {
+		return nil, false, "", err
+	}
+
+	for _, f := range filequery.Repository.PullRequest.Files.Edges {
+		cfo = append(cfo, ChangedFileObject{Path: f.Node.Path})
+	}
+
+	hasNext := filequery.Repository.PullRequest.Files.PageInfo.HasNextPage
+	nextCursor := string(filequery.Repository.PullRequest.Files.PageInfo.EndCursor)
+
+	return cfo, hasNext, nextCursor, nil
 }
 
 // GetPullRequest ...

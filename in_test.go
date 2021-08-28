@@ -162,7 +162,7 @@ func TestGet(t *testing.T) {
 			github.GetPullRequestReturns(tc.pullRequest, nil)
 
 			if tc.files != nil {
-				github.GetChangedFilesReturns(tc.files, nil)
+				github.GetChangedFilesReturns(tc.files, false, "", nil)
 			}
 
 			git := new(fakes.FakeGit)
